@@ -1,79 +1,56 @@
 import torch
 import torch.nn as nn
-import net.Synthesis
-import torch.nn.functional as fn
-from torch.utils.data import Dataset, DataLoader, random_split
-from torchvision import transforms
-import matplotlib.pyplot as plt
-import os, glob
-from dataclasses import dataclass, asdict
-from typing import Any, List, Optional, Tuple, Union
-import numpy
-from PIL import Image
+from net.vgg import vgg19
+from net.Model import Model
+from loss.VGGPerceptualLoss import SynthesisLoss
+from loss.SegmentationLoss import SegmentationLoss
+from torch.utils.data import random_split
+from net.Discriminator import MultitaskDiscriminator
+import os
+from typing import Optional
 
-
-class ImageDataset(Dataset):
-    def __init__(
-            self,
-            data_dir: Union[str, os.PathLike],
-            resolution: int = 64,
-            center_crop: bool = True,
-            ext: str = "jpg",
-    ):
-        self.images = sorted(
-            [f for f in glob.glob(os.path.join(data_dir, f"*.{ext}"))]
-        )
-        self.pre_proc = transforms.Compose(
-            [
-                transforms.Resize(resolution, interpolation=transforms.InterpolationMode.BILINEAR),
-                transforms.CenterCrop(resolution) if center_crop else transforms.RandomCrop(resolution),
-                transforms.ToTensor(),
-            ]
-        )
-    
-    def __len__(self) -> int:
-        return len(self.images)
-    
-    def __getitem__(self, idx: int) -> Tensor:
-        img = Image.open(self.images[idx]).convert("RGB")
-        return self.pre_proc(img)
-
-
-batch_size = 512
+batch_size = 16
 lr = 3e-4
 adam_betas = (0.5, 0.999)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(device)
-model = Model()
-model_copy = Model().requires_grad_(False)
-model.to(device)
-model_copy.to(device)
 
-optimizer = torch.optim.Adam(model.parameters(), lr=lr, betas=adam_betas)
+lambda_1 = 0.5  # 控制合成损失和分割损失权重
+lambda_2 = 0.5  # 控制初始输出和最终输出的权重
+lambda_3 = 0.5  # 控制L1距离损失的权重
+
+vgg = vgg19(True)
+discriminator = MultitaskDiscriminator()
+synthesisLoss = SynthesisLoss(lambda_3)
+segmentationLoss = SegmentationLoss()
+d_loss_function = nn.BCELoss()
+model = Model()
+discriminator.to(device)
+vgg.to(device)
+synthesisLoss.to(device)
+d_loss_function.to(device)
+
+g_optimizer = torch.optim.Adam(model.parameters(), lr=lr, betas=adam_betas)
+d_optimizer = torch.optim.Adam(discriminator.parameters(), lr=lr, betas=adam_betas)
 
 dataset = ImageDataset("./img_align_celeba")
 generator = torch.Generator().manual_seed(123)
 train_dataset, test_dataset = random_split(dataset, [0.9, 0.1], generator=generator)
 
-rec_weight = 20
-idem_weight = 20
-tight_weight = 2.5
-idem_weight /= rec_weight
-tight_weight /= rec_weight
-loss_tight_clamp_ratio = 1.5
-
 last_epoch = 0
 train_loss_hist = []
 
-checkpoint_dir = "ign-celeba"
+checkpoint_dir = "checkpoints"
 os.makedirs(checkpoint_dir, exist_ok=True)
-checkpoint_name: Optional[str] = "epoch_560.pt"
+checkpoint_name: Optional[str] = "epoch_10.pt"
+
 if isinstance(checkpoint_name, str):
     path = os.path.join(checkpoint_dir, checkpoint_name)
     checkpoint = torch.load(path)
     last_epoch = checkpoint["epoch"]
     model.load_state_dict(checkpoint["model_state_dict"])
-    optimizer.load_state_dict(checkpoint["optim_state_dict"])
+    g_optimizer.load_state_dict(checkpoint["g_optim_state_dict"])
+    d_optimizer.load_state_dict(checkpoint["d_optim_state_dict"])
     train_loss_hist = checkpoint["train_loss_hist"]
 
 num_epochs = 200
@@ -83,50 +60,56 @@ for e in range(num_epochs):
     model.train()
     train_loss = 0.0
     
-    for x in train_dl:
-        bsz = x.shape[0]
-        x = x.to(device)
-        # normalize
-        x = 2.0 * x - 1.0
+    for x_mr, x_ct, x_mask in train_dataset:
+        bsz = x_mr.shape[0]
+        x_mr = x_mr.to(device)
+        x_ct = x_ct.to(device)
+        x_mask = x_mask.to(device)
         
-        # get noise from input frequency statistics
-        #   freq_means_and_stds = get_freq_means_and_stds(x)
-        #   z = torch.stack([get_noise(*freq_means_and_stds) for _ in range(bsz)])
-        # two lines shown above are the old sampling code I used for training
-        freq_means_and_stds = torch.stack(get_freq_means_and_stds(x)).unsqueeze_(0)
-        num_dims = len(freq_means_and_stds.shape) - 1
-        freq_means_and_stds = freq_means_and_stds.repeat(
-            bsz, *(1,) * num_dims
-        ).unbind(dim=1)
-        z = get_noise(*freq_means_and_stds)
-        z = z.to(device, memory_format=torch.contiguous_format)
+        real = torch.cat((x_mr, x_ct, x_mask), dim=1)
+        real_labels = torch.ones(batch_size, 1)
+        fake_labels = torch.zeros(batch_size, 1)
         
-        # compute model outputs
-        model_copy.load_state_dict(model.state_dict())
-        fx = model(x)
-        fz = model(z)
-        f_z = fz.detach()
-        ff_z = model(f_z)
-        f_fz = model_copy(fz)
+        # 训练鉴别器
+        d_optimizer.zero_grad()
+        outputs = discriminator(real)
+        d_loss_real = d_loss_function(outputs, real_labels)
+        d_loss_real.backward()
         
-        # compute losses
-        loss_rec = fn.l1_loss(fx, x, reduction="none").view(bsz, -1).mean(dim=-1)
-        loss_idem = fn.l1_loss(f_fz, fz, reduction="mean")
-        loss_tight = -fn.l1_loss(ff_z, f_z, reduction="none").view(bsz, -1).mean(dim=-1)
-        loss_tight_clamp = loss_tight_clamp_ratio * loss_rec
-        loss_tight = fn.tanh(loss_tight / loss_tight_clamp) * loss_tight_clamp
-        loss_rec = loss_rec.mean()
-        loss_tight = loss_tight.mean()
+        _, _, x2_ct, y2 = model(x_mr)
+        fake = torch.cat((x_mr, x2_ct, y2), dim=1)
+        outputs = discriminator(fake)
+        d_loss_fake = d_loss_function(outputs, fake_labels)
+        d_loss_fake.backward()
+        d_optimizer.step()
         
-        loss = loss_rec + idem_weight * loss_idem + tight_weight * loss_tight
+        # 训练主模型
+        g_optimizer.zero_grad()
+        x1_ct, y1, x2_ct, y2 = model(x_mr)
+        fake = torch.cat((x_mr, x2_ct, y2), dim=1)
         
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        # Gan损失
+        outputs = discriminator(fake)
+        g_loss = d_loss_function(outputs, real_labels)
         
-        train_loss += loss.item() * bsz
+        # 合成损失
+        synthesisLoss1 = synthesisLoss(x1_ct, x_ct)
+        synthesisLoss2 = synthesisLoss(x2_ct, x_ct)
+        total_syn_loss = lambda_2 * synthesisLoss1 + (1 - lambda_2) * synthesisLoss2
+        
+        # 分割损失
+        segmentationloss1 = segmentationLoss(y1, x_mask)
+        segmentationloss2 = segmentationLoss(y2, x_mask)
+        total_seg_loss = lambda_2 * segmentationloss1 + (1 - lambda_2) * segmentationloss2
+        
+        total_loss = g_loss + lambda_1 * total_syn_loss + (1 - lambda_1) * total_seg_loss
+        total_loss.backward()
+        # 更新生成器权重
+        g_optimizer.step()
+        
+        train_loss += total_loss.item() * bsz
     
-    train_loss /= len(train_dl.dataset)
+    train_loss /= len(train_dataset.dataset)
     train_loss_hist.append(train_loss)
     
     epoch = e + last_epoch + 1
@@ -138,13 +121,9 @@ for e in range(num_epochs):
             {
                 "epoch": epoch,
                 "model_state_dict": model.state_dict(),
-                "optim_state_dict": optimizer.state_dict(),
+                "g_optim_state_dict": g_optimizer.state_dict(),
+                "d_optim_state_dict": d_optimizer.state_dict(),
                 "train_loss_hist": train_loss_hist,
             },
             path,
         )
-
-
-
-
-
