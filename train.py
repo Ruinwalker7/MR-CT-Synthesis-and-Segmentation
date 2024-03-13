@@ -8,11 +8,15 @@ from torch.utils.data import random_split
 from net.Discriminator import MultitaskDiscriminator
 import os
 from typing import Optional
+from dataset.testDataset import getDateset
+from torch.utils.data import Dataset, DataLoader
 
-batch_size = 16
+batch_size = 1
 lr = 3e-4
 adam_betas = (0.5, 0.999)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+slices_size = 1 # slice数量
+OAR_size = 5    # OAR数量
 print(device)
 
 lambda_1 = 0.5  # 控制合成损失和分割损失权重
@@ -29,11 +33,13 @@ discriminator.to(device)
 vgg.to(device)
 synthesisLoss.to(device)
 d_loss_function.to(device)
+model.to(device)
 
 g_optimizer = torch.optim.Adam(model.parameters(), lr=lr, betas=adam_betas)
 d_optimizer = torch.optim.Adam(discriminator.parameters(), lr=lr, betas=adam_betas)
 
-dataset = ImageDataset("./img_align_celeba")
+dataset = getDateset()
+data_loader = DataLoader(dataset, batch_size=batch_size)
 generator = torch.Generator().manual_seed(123)
 train_dataset, test_dataset = random_split(dataset, [0.9, 0.1], generator=generator)
 
@@ -42,7 +48,7 @@ train_loss_hist = []
 
 checkpoint_dir = "checkpoints"
 os.makedirs(checkpoint_dir, exist_ok=True)
-checkpoint_name: Optional[str] = "epoch_10.pt"
+checkpoint_name: Optional[str] = None
 
 if isinstance(checkpoint_name, str):
     path = os.path.join(checkpoint_dir, checkpoint_name)
@@ -53,7 +59,7 @@ if isinstance(checkpoint_name, str):
     d_optimizer.load_state_dict(checkpoint["d_optim_state_dict"])
     train_loss_hist = checkpoint["train_loss_hist"]
 
-num_epochs = 200
+num_epochs = 1
 save_interval = 15
 
 for e in range(num_epochs):
@@ -62,13 +68,17 @@ for e in range(num_epochs):
     
     for x_mr, x_ct, x_mask in train_dataset:
         bsz = x_mr.shape[0]
+        # print(x_mr.shape)
+        # print(x_ct.shape)
+        # print(x_mask.shape)
+
         x_mr = x_mr.to(device)
         x_ct = x_ct.to(device)
         x_mask = x_mask.to(device)
         
         real = torch.cat((x_mr, x_ct, x_mask), dim=1)
-        real_labels = torch.ones(batch_size, 1)
-        fake_labels = torch.zeros(batch_size, 1)
+        real_labels = torch.ones(slices_size, 1).to(device)
+        fake_labels = torch.zeros(slices_size, 1).to(device)
         
         # 训练鉴别器
         d_optimizer.zero_grad()
